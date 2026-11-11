@@ -115,7 +115,7 @@
   }
 
   function pinHeader() {
-    if (!header || header.classList.contains("hdr")) return;
+    if (!header) return;
     if (!mobileQ.matches || d.documentElement.classList.contains("nav-open")) {
       if (headerShift) {
         headerShift = 0;
@@ -443,17 +443,22 @@
     }
     location.href = href;
   }
-  var FORM_ENDPOINT = "about:blank"; // PREVIEW: no-op, nothing is sent
+  var FORM_ENDPOINT = "https://example.invalid/preview-no-send";
   var MAX_UPLOAD = 10 * 1024 * 1024;
   // FormSubmit reCAPTCHA. Off: the post goes through a hidden frame. On success FormSubmit
-  // redirects that frame to /thank-you/, and this page follows. On: the visitor is sent to
+  // redirects that frame to /thank-you/, and this page follows. A cross-origin or unreadable
+  // load counts too (FormSubmit's own page, a Cloudflare interstitial, or a script or meta
+  // redirect), and this page still goes to /thank-you/. On: the visitor is sent to
   // FormSubmit's captcha page (it cannot load in a frame), then lands on /thank-you/.
-  // The Google Ads form conversion lives only on /thank-you/.
-  // If the frame does not get there, the visitor gets a prefilled email and a phone link.
+  // The form conversion is AW-18528347675/PTnLCK3M2aodEJvMgINF. /thank-you/ fires it once
+  // from si_submitted. If the visitor already opened the mailto or tel fallback, the hit is
+  // fired here instead, and si_converted keeps /thank-you/ from firing it again.
+  // A network error, or 12 seconds with no load, shows a prefilled email and a phone link.
   // That path records form_fallback with no send_to, so it is not the form conversion.
   // Phone taps stay on the tel: listener above, including the fallback call link.
   var USE_CAPTCHA = false;
-  var THANK_YOU = "/simpleinsure-preview/thank-you/";
+  var THANK_YOU = "/thank-you/";
+  var FORM_CONVERSION = "AW-18528347675/PTnLCK3M2aodEJvMgINF";
   var FALLBACK_WAIT_MS = 12000;
   var FALLBACK_GIVE_UP_MS = 45000;
   var FALLBACK_UPLOAD_GIVE_UP_MS = 120000;
@@ -465,20 +470,34 @@
   }
   function frameLocation(frame) {
     try {
-      var loc = frame.contentWindow && frame.contentWindow.location;
-      if (!loc) return { path: "", href: "" };
-      return { path: loc.pathname || "", href: loc.href || "" };
+      var win = frame.contentWindow;
+      if (!win) return { path: "", href: "", unreadable: true };
+      var loc = win.location;
+      if (!loc) return { path: "", href: "", unreadable: true };
+      var href = loc.href || "";
+      return { path: loc.pathname || "", href: href, unreadable: false };
     } catch (e) {
       return null;
     }
   }
   function isBlankFrame(info) {
-    if (!info) return false;
+    // Null location and cross-origin frames are unreadable, not blank.
+    // Only the frame's initial about:blank load should be ignored.
+    if (!info || info.unreadable) return false;
     if (!info.href || info.href === "about:blank") return true;
     return info.path === "blank";
   }
-  function isThankYouPath(path) {
-    return /\/thank-you(\/|\/index\.html)?$/.test(path);
+  function formConversionRecorded() {
+    try { return sessionStorage.getItem("si_converted") === "1"; } catch (e) { return false; }
+  }
+  function fireFormConversion() {
+    if (formConversionRecorded()) return;
+    try {
+      sessionStorage.setItem("si_converted", "1");
+      sessionStorage.removeItem("si_submitted");
+    } catch (e) {}
+    if (typeof gtag !== "function") return;
+    gtag("event", "conversion", { send_to: FORM_CONVERSION });
   }
   function trackFormFallback(form, why) {
     form.setAttribute("data-fallback-reason", why || "error");
@@ -624,10 +643,6 @@
       if (btn) { btn.disabled = false; btn.textContent = form.getAttribute("data-final") || "Send"; }
       if (err) { err.textContent = msg; err.hidden = false; }
     }
-    // PREVIEW ONLY: never post anywhere. Go straight to the thank-you page.
-    if (btn) { btn.disabled = true; btn.textContent = "Sending\u2026"; }
-    location.href = thankYouUrl(form);
-    return;
     var honey = form.querySelector('input[name="_honey"]');
     if (honey && honey.value) { showState(form, "sent"); return; }
     var files = filesOf(form);
@@ -732,6 +747,7 @@
     function markSubmitted() {
       try {
         sessionStorage.setItem("si_submitted", "1");
+        sessionStorage.removeItem("si_converted");
         var reason = reasonValue(form);
         if (reason) sessionStorage.setItem("si_reason", reason);
         else sessionStorage.removeItem("si_reason");
@@ -761,10 +777,15 @@
       clearTimers();
       removeTransport();
       if (form.__handoff) {
+        // Mail or the phone is already open, so stay here and count once.
+        // si_converted stops /thank-you/ from recording the same submission.
+        fireFormConversion();
         var note = form.querySelector(".done:not(.sent) .lede");
         if (note) note.textContent = "The page send went through as well. If your email or call is already open, you can finish that.";
         return;
       }
+      // Keep si_submitted so /thank-you/ records the conversion. Do not fire it here.
+      markSubmitted();
       location.replace(thankYouUrl(form));
     }
     function hardFail(why) {
@@ -789,8 +810,12 @@
       if (!attempt.posted || attempt.settled) return;
       var info = frameLocation(frame);
       if (isBlankFrame(info)) return;
-      if (info && isThankYouPath(info.path)) succeed();
-      else hardFail("error");
+      // Thank-you, a cross-origin document, or an unreadable location (null, or still
+      // on formsubmit.co). A 200 HTML page, interstitial, or redirect counts as a
+      // likely success. A browser error page is opaque as well, so a failed navigation
+      // that still fires load is counted here. A request that never loads, or an error
+      // event, uses the fallback. A later load still counts after that fallback is shown.
+      succeed();
     });
     frame.addEventListener("error", function () {
       if (!attempt.posted) return;
